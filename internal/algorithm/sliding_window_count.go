@@ -20,12 +20,12 @@ import (
 const slidingWindowCounterScript = `
 local curr_key = KEYS[1]
 local prev_key = KEYS[2]
-local limit = toNumber(ARGV[1])
-local prev_weight = toNumber(ARGV[2])
-local ttl = toNumber(ARGV[3])
+local limit = tonumber(ARGV[1])
+local prev_weight = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
 
-local curr_count = toNumber(redis.call("GET, curr_key)) or 0
-local prev_count = toNumber(redis.call("GET, prev_key)) or 0
+local curr_count = tonumber(redis.call("GET, curr_key)) or 0
+local prev_count = tonumber(redis.call("GET, prev_key)) or 0
 
 -- Weighted estimate of requests in the rolling window
 local estimate = math.floor(prev_count * prev_weight) + curr_count
