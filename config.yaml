@@ -1,0 +1,39 @@
+server:
+  port: 8080
+  read_timeout: 5s
+  write_timeout: 5s
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 20
+
+# Switch this one line to change algorithm across all rules.
+# No code change needed — just restart the service.
+algorithm: token_bucket
+
+fault_tolerance:
+  on_store_failure: fail_open # fail_open | fail_closed
+
+rules:
+  - dimension: ip
+    limit: 100
+    window: 60s
+
+  - dimension: user
+    limit: 100
+    window: 60s
+
+  - dimension: route
+    route: "/api/v1/login"
+    limit: 10
+    window: 60s
+    token_bucket:
+      capacity: 10
+      refill_rate: 0.16 # ~10 per minute
+
+  - dimension: route
+    route: "api/v1/search"
+    limit: 500
+    window: 60s
