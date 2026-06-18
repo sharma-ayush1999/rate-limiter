@@ -4,6 +4,8 @@ A production-grade, distributed rate limiter service written in Go. Designed to 
 
 ---
 
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -58,7 +60,7 @@ The algorithm is fully configurable via YAML — switching from Token Bucket to 
 Requests can be limited on any combination of the following. Each dimension has its own quota config. A request is **denied if any applicable rule denies it**.
 
 | Dimension | Example Key | Use Case |
-|---|---|---|
+| --- | --- | --- |
 | IP Address | `ip:203.0.113.42` | Protect against abuse from a single host |
 | User / API Key | `user:abc123` | Per-user quotas for authenticated APIs |
 | Endpoint / Route | `route:/api/v1/login` | Stricter limits on sensitive endpoints |
@@ -70,12 +72,14 @@ Rules are matched in order of specificity: `endpoint+user` > `endpoint+ip` > `us
 ## Algorithms
 
 ### 1. Token Bucket
+
 Each key gets a bucket with a max capacity of `N` tokens. Tokens refill at a fixed rate. Requests consume one token; if the bucket is empty, the request is denied.
 
 - **Best for:** APIs that allow short bursts but need a sustained rate limit
 - **Redis ops:** Lua script (atomic read-modify-write)
 
 ### 2. Fixed Window
+
 Counts requests in discrete time windows (e.g., 0–60s, 60–120s). Resets counter at window boundary.
 
 - **Best for:** Simple per-minute or per-hour limits
@@ -83,12 +87,14 @@ Counts requests in discrete time windows (e.g., 0–60s, 60–120s). Resets coun
 - **Trade-off:** Burst allowed at window boundaries (up to 2× the limit)
 
 ### 3. Sliding Window Counter
+
 Approximates a true sliding window using two fixed windows (current + previous) weighted by time elapsed. Efficient and accurate enough for most use cases.
 
 - **Best for:** High-throughput APIs needing smooth limiting without log storage
 - **Redis ops:** Two `GET` + Lua for atomic update
 
 ### 4. Sliding Window Log
+
 Stores a timestamp log per key in a Redis sorted set. Counts entries within the rolling window on each request.
 
 - **Best for:** Precise rate limiting where exact counts matter
@@ -96,6 +102,7 @@ Stores a timestamp log per key in a Redis sorted set. Counts entries within the 
 - **Trade-off:** Higher memory usage per key
 
 ### 5. Leaky Bucket
+
 Requests enter a queue (bucket) and are processed at a fixed output rate. Excess requests that overflow the bucket are denied.
 
 - **Best for:** Smoothing bursty traffic to a constant output rate
@@ -132,6 +139,7 @@ Requests enter a queue (bucket) and are processed at a fixed output rate. Excess
 ```
 
 ### Strategy Pattern
+
 All algorithms implement a single `RateLimiter` interface:
 
 ```go
@@ -163,7 +171,7 @@ Pod B ──┘
 Algorithms and their atomic primitives:
 
 | Algorithm | Redis Atomic Mechanism |
-|---|---|
+| --- | --- |
 | Fixed Window | `INCR` + `EXPIRE` |
 | Token Bucket | Lua script (read tokens → refill → consume → write) |
 | Sliding Window Log | Lua script (`ZADD` + `ZREMRANGE` + `ZCARD`) |
@@ -269,11 +277,12 @@ redis:
   db: 0
   pool_size: 20
 
-algorithm: "token_bucket"   # token_bucket | fixed_window | sliding_window_counter
-                             # sliding_window_log | leaky_bucket
+algorithm:
+  "token_bucket" # token_bucket | fixed_window | sliding_window_counter
+  # sliding_window_log | leaky_bucket
 
 fault_tolerance:
-  on_redis_failure: "fail_open"   # fail_open (allow all) | fail_closed (deny all)
+  on_redis_failure: "fail_open" # fail_open (allow all) | fail_closed (deny all)
 
 rules:
   - dimension: ip
@@ -304,15 +313,17 @@ rules:
 Check whether a request should be allowed.
 
 **Request body:**
+
 ```json
 {
-  "ip":      "203.0.113.42",
+  "ip": "203.0.113.42",
   "user_id": "user:abc123",
-  "route":   "/api/v1/login"
+  "route": "/api/v1/login"
 }
 ```
 
 **Response — Allowed (200):**
+
 ```json
 {
   "allowed": true,
@@ -322,6 +333,7 @@ Check whether a request should be allowed.
 ```
 
 **Response — Denied (429):**
+
 ```json
 {
   "allowed": false,
@@ -373,6 +385,7 @@ curl -X POST http://localhost:8080/check \
 ```
 
 `docker-compose.yml` includes:
+
 - `ratelimiter` service (Go binary)
 - `redis` service (Redis 7 Alpine)
 - Health checks wired up
@@ -404,7 +417,7 @@ The Horizontal Pod Autoscaler (HPA) scales pods based on CPU utilization (target
 ## Fault Tolerance
 
 | Failure Scenario | Behavior |
-|---|---|
+| --- | --- |
 | Redis unreachable | Configurable: `fail_open` (allow all) or `fail_closed` (deny all) |
 | Redis slow (timeout) | Circuit breaker opens after N failures; falls back to policy above |
 | Pod crash | Other pods unaffected; state in Redis is unaffected |
@@ -450,33 +463,33 @@ The concurrent test suite fires N goroutines simultaneously against each algorit
 
 ## Build Steps (Implementation Order)
 
-| Step | What you'll build |
-|---|---|
-| 1 | Project scaffold — Go module, folder structure, dependencies |
-| 2 | Core `RateLimiter` interface + Strategy pattern + factory |
-| 3 | Redis store abstraction + in-memory fallback |
-| 4 | Algorithm: Token Bucket (with Lua script) |
-| 5 | Algorithm: Fixed Window |
-| 6 | Algorithm: Sliding Window Counter |
-| 7 | Algorithm: Sliding Window Log |
-| 8 | Algorithm: Leaky Bucket |
-| 9 | Config system — YAML loader + env overrides |
-| 10 | HTTP service — `/check`, `/health`, `/ready` handlers |
-| 11 | Multi-dimension key resolution (IP + user + route rules) |
-| 12 | Fault tolerance — circuit breaker + fail-open/closed |
-| 13 | Unit tests + integration tests + race tests |
-| 14 | Dockerfile + docker-compose |
-| 15 | Kubernetes manifests — Deployment, Service, ConfigMap, HPA |
+| Step | What you'll build                                            |
+| ---- | ------------------------------------------------------------ |
+| 1    | Project scaffold — Go module, folder structure, dependencies |
+| 2    | Core `RateLimiter` interface + Strategy pattern + factory    |
+| 3    | Redis store abstraction + in-memory fallback                 |
+| 4    | Algorithm: Token Bucket (with Lua script)                    |
+| 5    | Algorithm: Fixed Window                                      |
+| 6    | Algorithm: Sliding Window Counter                            |
+| 7    | Algorithm: Sliding Window Log                                |
+| 8    | Algorithm: Leaky Bucket                                      |
+| 9    | Config system — YAML loader + env overrides                  |
+| 10   | HTTP service — `/check`, `/health`, `/ready` handlers        |
+| 11   | Multi-dimension key resolution (IP + user + route rules)     |
+| 12   | Fault tolerance — circuit breaker + fail-open/closed         |
+| 13   | Unit tests + integration tests + race tests                  |
+| 14   | Dockerfile + docker-compose                                  |
+| 15   | Kubernetes manifests — Deployment, Service, ConfigMap, HPA   |
 
 ---
 
 ## Dependencies
 
-| Package | Purpose |
-|---|---|
-| `github.com/redis/go-redis/v9` | Redis client |
-| `github.com/spf13/viper` | Config loading (YAML + env) |
-| `github.com/go-chi/chi/v5` | HTTP router |
-| `github.com/testcontainers/testcontainers-go` | Integration test Redis |
-| `github.com/sony/gobreaker` | Circuit breaker |
-| `go.uber.org/zap` | Structured logging |
+| Package                                       | Purpose                     |
+| --------------------------------------------- | --------------------------- |
+| `github.com/redis/go-redis/v9`                | Redis client                |
+| `github.com/spf13/viper`                      | Config loading (YAML + env) |
+| `github.com/go-chi/chi/v5`                    | HTTP router                 |
+| `github.com/testcontainers/testcontainers-go` | Integration test Redis      |
+| `github.com/sony/gobreaker`                   | Circuit breaker             |
+| `go.uber.org/zap`                             | Structured logging          |
