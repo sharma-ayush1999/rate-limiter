@@ -15,14 +15,46 @@ type RedisStore struct {
 	client *redis.Client
 }
 
-func NewRedisStore(addr, password string, db int) (*RedisStore, error) {
+// RedisOptions holds all Redis connection settings.
+// Mirrors config.RedisConfig but lives in the store package
+// to keep the store independent of the config package.
+type RedisOptions struct {
+	Addr         string
+	Password     string
+	DB           int
+	PoolSize     int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+}
+
+func NewRedisStore(opts RedisOptions) (*RedisStore, error) {
+	// Apply sensible defaults for anything not set
+	if opts.PoolSize == 0 {
+		opts.PoolSize = 10
+	}
+	if opts.DialTimeout == 0 {
+		opts.DialTimeout = 5 * time.Second
+	}
+	if opts.ReadTimeout == 0 {
+		opts.ReadTimeout = 3 * time.Second
+	}
+	if opts.WriteTimeout == 0 {
+		opts.WriteTimeout = 3 * time.Second
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr: addr,
-		Password: password,
-		DB: db,
+		Addr:         opts.Addr,
+		Password:     opts.Password,
+		DB:           opts.DB,
+		PoolSize:     opts.PoolSize,
+		DialTimeout:  opts.DialTimeout,
+		ReadTimeout:  opts.ReadTimeout,
+		WriteTimeout: opts.WriteTimeout,
 	})
 
-	// verify connection on startup
+	// Verify connection on startup — fail fast rather than discovering
+	// Redis is unreachable on the first real request.
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		return nil, fmt.Errorf("redis connect failed: %w", err)
 	}

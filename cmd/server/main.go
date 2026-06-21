@@ -31,15 +31,30 @@ func main() {
 	}
 		
 	// --- Store ---
-	redisStore, err := store.NewRedisStore(
-		cfg.Redis.Addr,
-		cfg.Redis.Password,
-		cfg.Redis.DB,
-	)
+	redisStore, err := store.NewRedisStore(store.RedisOptions{
+		Addr:         cfg.Redis.Addr,
+		Password:     cfg.Redis.Password,
+		DB:           cfg.Redis.DB,
+		PoolSize:     cfg.Redis.PoolSize,
+		DialTimeout:  cfg.Redis.DialTimeout,
+		ReadTimeout:  cfg.Redis.ReadTimeout,
+		WriteTimeout: cfg.Redis.WriteTimeout,
+	})
 	if err != nil {
-		log.Fatal("Failed to connect to redis", zap.Error(err))
+		log.Fatal("failed to connect to redis", zap.Error(err))
 	}
-	log.Info("connected to redis", zap.String("addr", cfg.Redis.Addr))
+	log.Info("connected to redis",
+		zap.String("addr", cfg.Redis.Addr),
+		zap.Int("pool_size", cfg.Redis.PoolSize),
+	)
+
+	// Wrap with circuit breaker — trips open after 5 consecutive Redis failures.
+	// Falls back to the configured fail policy (fail_open or fail_closed).
+	policy := store.FailOpen
+	if cfg.FaultTolerance.OnStoreFailure == "fail_closed" {
+		policy = store.FailClosed
+	}
+	cbStore := store.NewCircuitBreakerStore(redisStore, policy)
 
 	// --- Build one limiter per rule ---
 	// Key format matches resolveRule() in handler/check.go:
@@ -47,7 +62,7 @@ func main() {
 	limiters := make(map[string]algorithm.RateLimiter)
 
 	for _, rule := range cfg.Rules {
-		limiter, err := algorithm.New(cfg.Algorithm, rule, redisStore)
+		limiter, err := algorithm.New(cfg.Algorithm, rule, cbStore)
 		if err != nil {
 			log.Fatal("failed to create limiter",
 			zap.String("dimension", rule.Dimension),
@@ -83,7 +98,7 @@ func main() {
 
 	r.Post("/check", checker.ServerHttp)
 	r.Get("/health", handler.HealthHandler)
-	r.Get("/ready", handler.ReadyHandler(redisStore))
+	r.Get("/ready", handler.ReadyHandler(cbStore))
 
 	
 	// --- Server ---

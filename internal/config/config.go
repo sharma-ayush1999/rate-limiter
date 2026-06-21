@@ -18,10 +18,13 @@ type ServerConfig struct {
 }
 
 type RedisConfig struct {
-	Addr		string	`mapstructure:"addr"`
-	Password	string	`mapstructure:"password"`
-	DB			int		`mapstructure:"db"`
-	PoolSize	int		`mapstructure:"pool_size"`
+	Addr         string        `mapstructure:"addr"`
+	Password     string        `mapstructure:"password"`
+	DB           int           `mapstructure:"db"`
+	PoolSize     int           `mapstructure:"pool_size"`
+	DialTimeout  time.Duration `mapstructure:"dial_timeout"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout"`
 }
 
 // FaultConfig controls behavior when the store is unavailable.

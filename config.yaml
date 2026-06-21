@@ -8,6 +8,9 @@ redis:
   password: ""
   db: 0
   pool_size: 20
+  dial_timeout: 5s    # max time to establish a new connection
+  read_timeout: 3s    # max time to wait for a reply
+  write_timeout: 3s   # max time to wait for a write to complete
 
 # Switch this one line to change algorithm across all rules.
 # No code change needed — just restart the service.
