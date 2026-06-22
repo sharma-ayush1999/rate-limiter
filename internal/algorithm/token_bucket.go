@@ -9,6 +9,12 @@ import (
 	"github.com/sharma-ayush1999/go-ratelimiter/internal/store"
 )
 
+// tokensKey / refillKey suffixes for the native in-memory path.
+const (
+	nativeTokSuffix    = ":mem:t"
+	nativeRefillSuffix = ":mem:r"
+)
+
 // tokenBucketScript is the Lua script executed atomically on Redis.
 // Defined at package level so it's compiled once, not on every request.
 const tokenBucketScript = `
@@ -57,36 +63,89 @@ type TokenBucketConfig struct {
 // TokenBucket implements the RateLimiter interface using the token bucket algorithm.
 // Safe for concurrent use by multiple goroutines.
 type TokenBucket struct {
-	store store.Store
-	config TokenBucketConfig
-	mu sync.Mutex	// guards in-memory fallback path only
+	store     store.Store
+	config    TokenBucketConfig
+	mu        sync.Mutex // guards native in-memory path
+	useNative bool       // true when store is MemoryStore (no Lua support)
 }
 
 // NewTokenBucket creates a new TokenBucket limiter.
 func NewTokenBucket(s store.Store, cfg TokenBucketConfig) *TokenBucket {
-	return &TokenBucket{store: s, config: cfg}
+	_, isMemory := s.(*store.MemoryStore)
+	return &TokenBucket{store: s, config: cfg, useNative: isMemory}
 }
 
 func (t *TokenBucket) Allow(ctx context.Context, key string) (RateStatus, error) {
-	now := float64(time.Now().UnixNano()) / 1e9	// Unix timestamp as float seconds
+	if t.useNative {
+		return t.allowNative(ctx, key)
+	}
+
+	now := float64(time.Now().UnixNano()) / 1e9
 	ttl := int64(t.config.Window.Seconds())
 
-	result, err := t.store.Eval(ctx, tokenBucketScript, 
+	result, err := t.store.Eval(ctx, tokenBucketScript,
 		[]string{key},
 		t.config.Capacity,
 		t.config.RefillRate,
 		now,
 		ttl,
-	)	
-
+	)
 	if err != nil {
-		// Eval failed — store might be unavailable.
-		// Fault tolerance (fail-open/closed) is handled by the circuit breaker
-		// wrapping the store (added in Step 12). For now, return the error.
 		return RateStatus{}, fmt.Errorf("token bucket eval: %w", err)
 	}
-
 	return t.parseResult(result)
+}
+
+// allowNative is the MemoryStore path — implements token bucket using
+// Get/Set + mutex instead of a Lua script.
+func (t *TokenBucket) allowNative(ctx context.Context, key string) (RateStatus, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	tokKey    := key + nativeTokSuffix
+	refillKey := key + nativeRefillSuffix
+
+	tokensVal, _    := t.store.Get(ctx, tokKey)
+	lastRefillVal, _ := t.store.Get(ctx, refillKey)
+
+	now := time.Now().Unix()
+	var tokens int64
+	lastRefill := lastRefillVal
+
+	if lastRefill == 0 {
+		// First request — start with a full bucket.
+		tokens = t.config.Capacity
+		lastRefill = now
+	} else {
+		tokens = tokensVal
+		elapsed := now - lastRefill
+		refill  := int64(float64(elapsed) * t.config.RefillRate)
+		if refill > 0 {
+			tokens += refill
+			if tokens > t.config.Capacity {
+				tokens = t.config.Capacity
+			}
+			lastRefill = now
+		}
+	}
+
+	allowed := tokens >= 1
+	if allowed {
+		tokens--
+	}
+
+	_ = t.store.Set(ctx, tokKey,    tokens,     t.config.Window)
+	_ = t.store.Set(ctx, refillKey, lastRefill, t.config.Window)
+
+	status := RateStatus{
+		Allowed:   allowed,
+		Remaining: tokens,
+		ResetAt:   time.Now().Add(time.Duration(float64(time.Second) / t.config.RefillRate)),
+	}
+	if !allowed {
+		status.Reason = fmt.Sprintf("rate limit exceeded, %d tokens remaining", tokens)
+	}
+	return status, nil
 }
 
 // parseResult converts the raw Lua return value into a RateStatus.
@@ -120,5 +179,10 @@ func (t *TokenBucket) parseResult(result any) (RateStatus, error) {
 }
 
 func (t *TokenBucket) Reset(ctx context.Context, key string) error {
-	return t.store.Set(ctx, key, 0, time.Millisecond)	// set TTL to 1ms — expires almost immediately
+	if t.useNative {
+		_ = t.store.Set(ctx, key+nativeTokSuffix,    0, time.Millisecond)
+		_ = t.store.Set(ctx, key+nativeRefillSuffix, 0, time.Millisecond)
+		return nil
+	}
+	return t.store.Set(ctx, key, 0, time.Millisecond)
 }

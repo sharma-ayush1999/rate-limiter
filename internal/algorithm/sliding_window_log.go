@@ -3,6 +3,7 @@ package algorithm
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sharma-ayush1999/go-ratelimiter/internal/store"
@@ -53,58 +54,105 @@ type SlidingWindowLogConfig struct {
 
 // SlidingWindowLog implements RateLimiter using exact timestamp logging.
 // Each request's timestamp is stored in a Redis sorted set.
-// Safe for concurrent use — atomicity guaranteed by Lua script.
+// Safe for concurrent use — atomicity guaranteed by Lua script on Redis,
+// or by mutex + in-struct log on the native in-memory path.
 type SlidingWindowLog struct {
-	store store.Store
-	config SlidingWindowLogConfig
+	store     store.Store
+	config    SlidingWindowLogConfig
+	mu        sync.Mutex
+	useNative bool
+	logs      map[string][]int64 // key → sorted microsecond timestamps (native path only)
 }
 
 func NewSlidingWindowLog(s store.Store, cfg SlidingWindowLogConfig) *SlidingWindowLog {
+	_, isMemory := s.(*store.MemoryStore)
 	return &SlidingWindowLog{
-		store: s,
-		config: cfg,
+		store:     s,
+		config:    cfg,
+		useNative: isMemory,
+		logs:      make(map[string][]int64),
 	}
 }
 
-func (s * SlidingWindowLog) Allow(ctx context.Context, key string) (RateStatus, error) {
-	now := time.Now()
+func (s *SlidingWindowLog) Allow(ctx context.Context, key string) (RateStatus, error) {
+	if s.useNative {
+		return s.allowNative(key)
+	}
 
-	// Use microseconds for score precision.
-	// Microseconds ensure uniqueness even under very high concurrency
-	// (two requests in the same nanosecond get different scores).
-	nowMicro := now.UnixMicro()
-
-	// window_start = earliest timestamp still inside the rolling window
+	now         := time.Now()
+	nowMicro    := now.UnixMicro()
 	windowStart := now.Add(-s.config.Window).UnixMicro()
+	ttl         := int64(s.config.Window.Seconds()) + 1
 
-	// TTL: keep the sorted set alive for one full window after the last request
-	ttl := int64(s.config.Window.Seconds()) + 1
-
-	result, err := s.store.Eval(ctx, slidingWindowLogScript, 
+	result, err := s.store.Eval(ctx, slidingWindowLogScript,
 		[]string{key},
 		nowMicro,
 		windowStart,
 		s.config.Limit,
 		ttl,
 	)
-
 	if err != nil {
 		return RateStatus{}, fmt.Errorf("sliding window log eval: %w", err)
 	}
-
 	return s.parseResult(now, result)
+}
+
+// allowNative implements sliding window log using an in-struct sorted timestamp slice.
+// This path is used when the store is MemoryStore (unit tests, local dev).
+func (s *SlidingWindowLog) allowNative(key string) (RateStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now         := time.Now()
+	nowMicro    := now.UnixMicro()
+	windowStart := now.Add(-s.config.Window).UnixMicro()
+
+	// Remove expired timestamps (keep only those inside the window)
+	existing := s.logs[key]
+	valid    := existing[:0]
+	for _, ts := range existing {
+		if ts > windowStart {
+			valid = append(valid, ts)
+		}
+	}
+
+	count   := int64(len(valid))
+	allowed := count < s.config.Limit
+
+	if allowed {
+		valid = append(valid, nowMicro)
+	}
+	s.logs[key] = valid
+
+	remaining := s.config.Limit - count
+	if !allowed {
+		remaining = 0
+	}
+
+	status := RateStatus{
+		Allowed:   allowed,
+		Remaining: remaining,
+		ResetAt:   now.Add(s.config.Window),
+	}
+	if !allowed {
+		status.Reason = fmt.Sprintf(
+			"sliding window log limit of %d requests per %s exceeded",
+			s.config.Limit, s.config.Window,
+		)
+	}
+	return status, nil
 }
 
 func (s *SlidingWindowLog) parseResult(now time.Time, result any) (RateStatus, error) {
 	res, ok := result.([]interface{})
-	if !ok || len(res) != 2{
-		return RateStatus{}, fmt.Errorf("sliding indow log: unexpected result: %v", res)
+	if !ok || len(res) != 2 {
+		return RateStatus{}, fmt.Errorf("sliding window log: unexpected result: %v", result)
 	}
 
 	allowed, ok1 := res[0].(int64)
 	remaining, ok2 := res[1].(int64)
 	if !ok1 || !ok2 {
-		return RateStatus{}, fmt.Errorf("sliding indow log: unexpected result: %v", res)
+		return RateStatus{}, fmt.Errorf("sliding window log: unexpected types: %v", res)
 	}
 
 	status := RateStatus{
@@ -117,7 +165,7 @@ func (s *SlidingWindowLog) parseResult(now time.Time, result any) (RateStatus, e
 
 	if !status.Allowed {
 		status.Reason = fmt.Sprintf(
-			"sliding window log limit pf %d requests [er %s exceeded",
+			"sliding window log limit of %d requests per %s exceeded",
 			s.config.Limit,
 			s.config.Window,
 		)
@@ -126,8 +174,13 @@ func (s *SlidingWindowLog) parseResult(now time.Time, result any) (RateStatus, e
 	return status, nil
 }
 
-func (s *SlidingWindowLog) Reset(ctx context.Context, key string) error{
-	// Delete all members from the sorted set by removing scores from -inf to +inf
+func (s *SlidingWindowLog) Reset(ctx context.Context, key string) error {
+	if s.useNative {
+		s.mu.Lock()
+		delete(s.logs, key)
+		s.mu.Unlock()
+		return nil
+	}
 	_, err := s.store.Eval(ctx, `redis.call("DEL", KEYS[1]); return 1`, []string{key})
 	return err
 }

@@ -3,6 +3,7 @@ package algorithm
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sharma-ayush1999/go-ratelimiter/internal/store"
@@ -18,19 +19,19 @@ import (
 // ARGV[3] = window TTL in seconds
 
 const slidingWindowCounterScript = `
-local curr_key = KEYS[1]
-local prev_key = KEYS[2]
-local limit = tonumber(ARGV[1])
+local curr_key    = KEYS[1]
+local prev_key    = KEYS[2]
+local limit       = tonumber(ARGV[1])
 local prev_weight = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
+local ttl         = tonumber(ARGV[3])
 
-local curr_count = tonumber(redis.call("GET, curr_key)) or 0
-local prev_count = tonumber(redis.call("GET, prev_key)) or 0
+local curr_count = tonumber(redis.call("GET", curr_key)) or 0
+local prev_count = tonumber(redis.call("GET", prev_key)) or 0
 
 -- Weighted estimate of requests in the rolling window
 local estimate = math.floor(prev_count * prev_weight) + curr_count
 
-if estimates >= limit then
+if estimate >= limit then
 	return {0, 0, curr_count, prev_count}
 end
 
@@ -50,59 +51,95 @@ type SlidingWindowCounterConfig struct {
 }
 
 // SlidingWindowCounter implements RateLimiter using the sliding window counter algorithm.
-// Safe for concurrent use — atomicity guaranteed by Lua script on Redis.
+// Safe for concurrent use — atomicity guaranteed by Lua script on Redis,
+// or by mutex on the native in-memory path.
 type SlidingWindowCounter struct {
-	store store.Store
-	config SlidingWindowCounterConfig
-} 
+	store     store.Store
+	config    SlidingWindowCounterConfig
+	mu        sync.Mutex // guards native in-memory path
+	useNative bool
+}
 
 func NewSlidingWindowCounter(s store.Store, cfg SlidingWindowCounterConfig) *SlidingWindowCounter {
-	return &SlidingWindowCounter{
-		store: s,
-		config: cfg,
-	}
+	_, isMemory := s.(*store.MemoryStore)
+	return &SlidingWindowCounter{store: s, config: cfg, useNative: isMemory}
 }
 
 func (s *SlidingWindowCounter) Allow(ctx context.Context, key string) (RateStatus, error) {
-	now := time.Now()
-	windowSecs := int64(s.config.Window.Seconds())
-	
-	// Current and previous window bucket numbers
-	currBucket := now.Unix() / windowSecs
-	prevBucket := currBucket - 1
-	
-	currKey := fmt.Sprintf("%s:%d", key, currBucket)
-	prevKey := fmt.Sprintf("%s:%d", key, prevBucket)
+	now         := time.Now()
+	windowSecs  := int64(s.config.Window.Seconds())
+	currBucket  := now.Unix() / windowSecs
+	prevBucket  := currBucket - 1
+	currKey     := fmt.Sprintf("%s:%d", key, currBucket)
+	prevKey     := fmt.Sprintf("%s:%d", key, prevBucket)
+	elapsed     := float64(now.Unix()%windowSecs) / float64(windowSecs)
+	prevWeight  := 1.0 - elapsed
+	ttl         := windowSecs * 2
 
-	// How far into the current window are we? (0.0 = just started, 1.0 = about to end)
-	elapsed := float64(now.Unix()%windowSecs) / float64(windowSecs)
+	if s.useNative {
+		return s.allowNative(ctx, currKey, prevKey, prevWeight, ttl)
+	}
 
-	// Weight of the previous window = how much of it still falls in the rolling window
-	// At elapsed=0.0 → prevWeight=1.0 (current window just started, previous fully counts)
-	// At elapsed=1.0 → prevWeight=0.0 (current window almost done, previous fully expired)
-	prevWeight := 1.0 - elapsed
-
-	// TTL: current window key lives for 2× the window so the next window can still read it
-	// as its "previous window"
-	ttl := int64(s.config.Window.Seconds() * 2)
-
-	result, err := s.store.Eval(ctx, slidingWindowCounterScript, 
+	result, err := s.store.Eval(ctx, slidingWindowCounterScript,
 		[]string{currKey, prevKey},
 		s.config.Limit,
 		prevWeight,
 		ttl,
 	)
 	if err != nil {
-		return RateStatus{}, fmt.Errorf("sliding window counter Eval: %w", err)
-	}	
-
+		return RateStatus{}, fmt.Errorf("sliding window counter eval: %w", err)
+	}
 	return s.parseResult(result)
+}
+
+// allowNative implements the sliding window counter using Get/Increment + mutex.
+func (s *SlidingWindowCounter) allowNative(ctx context.Context, currKey, prevKey string, prevWeight float64, ttl int64) (RateStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	window   := time.Duration(ttl/2) * time.Second
+	prevCount, _ := s.store.Get(ctx, prevKey)
+	currCount, _ := s.store.Get(ctx, currKey)
+
+	estimate := int64(float64(prevCount)*prevWeight) + currCount
+	if estimate >= s.config.Limit {
+		windowSecs  := int64(s.config.Window.Seconds())
+		nowUnix     := time.Now().Unix()
+		nextBucket  := (nowUnix/windowSecs + 1) * windowSecs
+		return RateStatus{
+			Allowed:   false,
+			Remaining: 0,
+			ResetAt:   time.Unix(nextBucket, 0),
+			Reason: fmt.Sprintf("sliding window limit of %d requests per %s exceeded",
+				s.config.Limit, s.config.Window),
+		}, nil
+	}
+
+	newCount, err := s.store.Increment(ctx, currKey, window*2)
+	if err != nil {
+		return RateStatus{}, err
+	}
+
+	remaining := s.config.Limit - (int64(float64(prevCount)*prevWeight) + newCount)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	windowSecs := int64(s.config.Window.Seconds())
+	nowUnix    := time.Now().Unix()
+	nextBucket := (nowUnix/windowSecs + 1) * windowSecs
+
+	return RateStatus{
+		Allowed:   true,
+		Remaining: remaining,
+		ResetAt:   time.Unix(nextBucket, 0),
+	}, nil
 }
 
 func (s *SlidingWindowCounter) parseResult(result any) (RateStatus, error) {
 	res, ok := result.([]interface{})
 	if !ok || len(res) != 4 {
-		return RateStatus{}, fmt.Errorf("sliding window counter: unexpected result: %w", result)
+		return RateStatus{}, fmt.Errorf("sliding window counter: unexpected result: %v", result)
 	}
 
 	allowed, ok1 := res[0].(int64)
