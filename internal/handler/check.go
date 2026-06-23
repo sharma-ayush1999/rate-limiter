@@ -62,6 +62,9 @@ func (c *Checker) ServerHttp(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	var lastStatus algorithm.RateStatus 	// ← track last evaluated status
+
 	// Check all applicable rules in order.
 	// First denial wins — we stop and return immediately.
 	for _, rule := range c.rules {
@@ -79,6 +82,8 @@ func (c *Checker) ServerHttp(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		lastStatus = status
+
 		if !status.Allowed {
 			writeJSON(w, http.StatusTooManyRequests, CheckResponse{
 				Allowed: false,
@@ -89,6 +94,9 @@ func (c *Checker) ServerHttp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// All rules passed — request is allowed.
+	writeJSON(w, http.StatusOK, CheckResponse{Allowed: true, Remaining: lastStatus.Remaining, ResetAt: lastStatus.ResetAt})
 }
 
 // resolveRule determines whether a rule applies to this request,

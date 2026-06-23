@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  # ── Rate Limiter Service ───────────────────────────────────────────────────
+  ratelimiter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ratelimiter
+    ports:
+      - "8080:8080" # expose to host for local testing
+    environment:
+      # Override config.yaml values via environment variables.
+      # RL_ prefix + uppercase = viper env override.
+      # e.g. RL_REDIS_ADDR overrides redis.addr in config.yaml
+      RL_REDIS_ADDR: "redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy # wait until Redis passes its health check
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q0-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6380:6379" # expose to host so you can run redis-cli locally (6380 avoids conflict with local Redis)
+    command: >
+      redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+
+
+    # maxmemory      — cap Redis memory at 256MB
+    # allkeys-lru    — evict least-recently-used keys when full
+    # save ""        — disable RDB snapshots (rate limit state is ephemeral)
+    # appendonly no  — disable AOF persistence (same reason)
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  redis_data:
+    # Named volume — Redis data persists across container restarts.
+    # Remove with: docker-compose down -v
